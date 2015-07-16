@@ -2,7 +2,9 @@
 using System.Collections.Generic;
 using System.Configuration;
 using System.Data;
+using System.Data.Common;
 using System.Data.SQLite;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
@@ -15,44 +17,49 @@ namespace ManagerADO
         private string _connString = string.Empty;
         private SQLiteCommandBuilder _builder;
         private Dictionary<string, SQLiteDataAdapter> _adapters;
-        private int _schemaVersion = 1;
+        private int _schemaVersion = 0;
         private Dictionary<string, TableDef> _tableDefs;
 
-        public SQLiteStore(CreateSchemaHandler createSchemaHandler)
+        public SQLiteStore(ChangeSchemaHandler createSchemaHandler, int validSchemaVersion)
         {
             var cnStrings = ConfigurationManager.ConnectionStrings["StoreSQLiteProvider"];
             _connString = cnStrings.ConnectionString;
-            CreateSchema += createSchemaHandler;
-            Init(cnStrings.ProviderName);
+            ChangeSchema += createSchemaHandler;
+            Init(cnStrings.ProviderName, validSchemaVersion);
         }
 
         public SQLiteStore(string providerName, string connectionString)
         {
             _connString = connectionString;
-            Init(providerName);
+            Init(providerName, 1);
         }
 
-        private void Init(string providerName)
+        private void Init(string providerName, int validSchemaVersion)
         {
             _dataSet = new DataSet("Store");
             _adapters = new Dictionary<string, SQLiteDataAdapter>(StringComparer.CurrentCultureIgnoreCase);
 
             using (SQLiteConnection cnn = OpenConnection())
             {
-                CheckSchema(cnn);
+                CheckSchema(cnn, validSchemaVersion);
 
                 LoadTableDefs(cnn);
                 
                 foreach (TableDef tableDef in _tableDefs.Values)
                     ConfigureAdapter(tableDef);
 
-                //BuildTableRelationship();
+                BuildTableRelationship();
             }
         }
 
         private void LoadTableDefs(SQLiteConnection cnn)
         {
-            _tableDefs = new Dictionary<string, TableDef>(StringComparer.CurrentCultureIgnoreCase);
+            if (_tableDefs == null)
+                _tableDefs = new Dictionary<string, TableDef>(StringComparer.CurrentCultureIgnoreCase);
+            else
+                _tableDefs.Clear();
+
+            // read table defs
 
             SQLiteCommand cmd = GetCommand(cnn, "SELECT Id, Name, DisplayName FROM TableDefs");
             SQLiteDataReader reader = cmd.ExecuteReader();
@@ -69,11 +76,13 @@ namespace ManagerADO
             }
             reader.Close();
 
-            SQLiteParameter idParam = new SQLiteParameter();
+            // read column defs
 
-            cmd.CommandText = "SELECT Id, Name, DisplayName, Type FROM ColumnDefs WHERE TableId = ?";
+            cmd.CommandText = "SELECT Id, Name, DisplayName, Type, ParentTable FROM ColumnDefs WHERE TableId = ?";
+            SQLiteParameter idParam = new SQLiteParameter();
             cmd.Parameters.Add(idParam);
             cmd.Prepare();
+
             foreach (TableDef tableDef in _tableDefs.Values)
             {
                 List<ColumnDef> colDefs = new List<ColumnDef>();
@@ -87,7 +96,9 @@ namespace ManagerADO
                         id = reader.GetInt32(0),
                         name = reader.GetString(1),
                         displayName = reader.GetString(2),
-                        type = reader.GetString(3)
+                        type = reader.GetString(3),
+                        parentTable = reader.GetString(4),
+                        tableName = tableDef.name
                     };
 
                     colDefs.Add(colDef);
@@ -99,66 +110,115 @@ namespace ManagerADO
             }
         }
 
+        private void BuildTableRelationship()
+        {
+            foreach (TableDef tableDef in _tableDefs.Values)
+                foreach (ColumnDef colDef in tableDef.columns)
+                    if (colDef.IsChildTable)
+                    {
+                        DataColumn parentCol = _dataSet.Tables[colDef.parentTable].Columns["Id"];
+                        DataColumn childCol = _dataSet.Tables[tableDef.name].Columns[colDef.name];
+
+                        _dataSet.Relations.Add(colDef.RelationName, parentCol, childCol);
+                    }
+        }
+
         public int SchemaVersion
         {
             get { return _schemaVersion; }
         }
 
-        public delegate void CreateSchemaHandler(object sender);
-        public event CreateSchemaHandler CreateSchema;
+        public delegate void ChangeSchemaHandler(object sender, SQLiteConnection cnn, int currentVersion);
+        public event ChangeSchemaHandler ChangeSchema;
 
-        protected virtual void RaiseCreateSchema()
+        protected virtual void RaiseChangeSchema(SQLiteConnection cnn, int currentVersion)
         {
-            if (CreateSchema != null)
-                CreateSchema(this);
+            if (ChangeSchema != null)
+                ChangeSchema(this, cnn, currentVersion);
         }
 
-        private void CheckSchema(SQLiteConnection cnn)
+        private void CheckSchema(SQLiteConnection cnn, int validSchemaVersion)
         {
             SQLiteCommand cmd = GetCommand(cnn, "SELECT Version FROM Store");
-            object version = null;
-            
+            int version = 0;
+
             try
             {
-                version = cmd.ExecuteScalar();
+                version = (int)cmd.ExecuteScalar();
             }
             catch { }
 
-            if (version == null)
+            SQLiteTransaction trn;
+
+            if (version == 0)
             {
                 // create db schema
 
                 // common schema
                 string sql = string.Format(@"
 CREATE TABLE Store (Version INT);
-INSERT INTO Store VALUES ('{0}');", _schemaVersion);
+INSERT INTO Store VALUES ('{0}');", validSchemaVersion);
 
                 sql += @"
 CREATE TABLE TableDefs (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Name NVARCHAR NOT NULL,
-    DisplayName NVARCHAR
+    DisplayName NVARCHAR DEFAULT ''
 );
 CREATE TABLE ColumnDefs (
     Id INTEGER PRIMARY KEY AUTOINCREMENT,
     Name NVARCHAR NOT NULL,
     Type NVARCHAR,
-    DisplayName NVARCHAR,
+    DisplayName NVARCHAR DEFAULT '',
     TableId INT NOT NULL,
+    ParentTable NVARCHAR NOT NULL,
     FOREIGN KEY(TableId) REFERENCES TableDefs(Id)
 );
 CREATE INDEX Name_Idx ON ColumnDefs (Name)";
 
-                cmd.CommandText = sql;
-                cmd.ExecuteNonQuery();
-
-                //SQLiteTransaction trn = cnn.BeginTransaction();
-
-                // notify user to expand schema
-                RaiseCreateSchema();
+                trn = cnn.BeginTransaction(); 
                 
-                //trn.Commit(); // auto rollback on exception? 
+                try
+                {
+                    cmd.CommandText = sql;
+                    cmd.ExecuteNonQuery();
+
+                    // notify user to expand schema
+                    RaiseChangeSchema(cnn, 0);
+                    trn.Commit();
+
+                    _schemaVersion = validSchemaVersion;
+                }
+                catch
+                {
+                    trn.Rollback();
+                    _schemaVersion = 0;
+                    throw;
+                }
             }
+            else if ((int)version < validSchemaVersion)
+            {
+                trn = cnn.BeginTransaction();
+                
+                try
+                {
+                    // notify to change schema
+                    RaiseChangeSchema(cnn, version);
+
+                    ExecuteNonQuery(cnn, string.Format("UPDATE Store SET Version = '{0}';", validSchemaVersion));
+                    _schemaVersion = validSchemaVersion;
+
+                    trn.Commit();
+                }
+                catch
+                {
+                    trn.Rollback();
+                    _schemaVersion = 0;
+                    throw;
+                }
+            }
+            else
+                _schemaVersion = version;
         }
 
         private void ConfigureAdapter(TableDef tableDef)
@@ -178,6 +238,11 @@ CREATE INDEX Name_Idx ON ColumnDefs (Name)";
 
                 builder.DataAdapter = adapter;
 
+                // to update primary key
+                //adapter.InsertCommand = builder.GetInsertCommand();
+                //adapter.InsertCommand.CommandText = adapter.InsertCommand.CommandText + "; SELECT last_insert_rowid() AS Id";
+                //adapter.InsertCommand.UpdatedRowSource = UpdateRowSource.Both;
+                
                 _adapters.Add(tableDef.name, adapter);
             }
 
@@ -219,6 +284,7 @@ CREATE INDEX Name_Idx ON ColumnDefs (Name)";
 
         public void Update()
         {
+            //TODO: update order (parent-child relations) 
             foreach(var kv in _adapters)
                 kv.Value.Update(_dataSet, kv.Key);
         }
@@ -245,133 +311,130 @@ CREATE INDEX Name_Idx ON ColumnDefs (Name)";
             }
         }
 
-        // Manager
-
-        /*public TableDef[] TableDefs
-        {
-            get { return _tableDefs.ToArray(); }
-        }*/
+        // Schema Manager
 
         public TableDef GetTableDef(string tableName)
         {
             return _tableDefs[tableName];
         }
 
-        public void AddTable(TableDef tableDef, int newSchemaVersion = 0)
+        // Add new table
+        // cnn specified by CheckSchema create/update schema while Store object creating
+        // specify newSchemaVersion after Store object created
+        public void AddTable(SQLiteConnection cnn, TableDef tableDef, int newSchemaVersion = 0)
         {
             if (newSchemaVersion != 0 && _schemaVersion >= newSchemaVersion)
                 throw new ArgumentException("New schema version should be greater then current");
 
             string quotedTableName = QuoteIdentifier(tableDef.name);
+            
+            string sql = string.Format("INSERT INTO TableDefs (Name, DisplayName) VALUES ('{0}', '{1}');\n", tableDef.name, tableDef.displayName);
+            string colList = "Id INTEGER PRIMARY KEY AUTOINCREMENT, ";
+            string valList = string.Format("('Id','INTEGER','Id','',(SELECT Id FROM TableDefs WHERE Name = '{0}')), ", tableDef.name);
 
-            using (SQLiteConnection cnn = OpenConnection())
+            foreach (ColumnDef column in tableDef.columns)
             {
-                string sql = string.Empty;
-
-                sql = string.Format("INSERT INTO TableDefs (Name, DisplayName) VALUES ('{0}', '{1}');\n", tableDef.name, tableDef.displayName);
-                string colList = "Id INTEGER PRIMARY KEY AUTOINCREMENT, ";
-                string valList = string.Format("('Id','INTEGER','Id',(SELECT Id FROM TableDefs WHERE Name = '{0}')), ", tableDef.name);
-
-                foreach (ColumnDef column in tableDef.columns)
-                {
-                    if (column.type.StartsWith("TABLE")) // TABLE parentTable
-                    {
-                        colList += string.Format("{0} INT {1}, FOREIGN KEY({0}) REFERENCES 2}(Id), ",
-                            QuoteIdentifier(column.name),
-                            (column.allowDBNull) ? "NULL" : string.Empty,
-                            QuoteIdentifier(column.parentTable)
-                            );
-                    }
+                if (column.type.StartsWith("TABLE")) // TABLE parentTable
+                    colList += string.Format("{0} INTEGER {1}, FOREIGN KEY({0}) REFERENCES {2}(Id), ",
+                        QuoteIdentifier(column.name),
+                        (column.allowDBNull) ? string.Empty : "NOT NULL",
+                        QuoteIdentifier(column.parentTable)
+                    );
+                else
                     colList += string.Format("{0} {1} {2} {3}, ",
                         QuoteIdentifier(column.name),
                         column.type,
-                        (column.allowDBNull) ? "NULL" : string.Empty,
+                        (column.allowDBNull) ? string.Empty : "NOT NULL",
                         (column.defValue != null) ? "DEFAULT " + column.defValue : string.Empty
-                        );
+                    );
 
-                    valList += string.Format("('{0}','{1}','{2}',(SELECT Id FROM TableDefs WHERE Name = '{3}')), ",
-                        column.name, column.type, column.displayName, tableDef.name);
-                }
+                valList += string.Format("('{0}','{1}','{2}','{3}',(SELECT Id FROM TableDefs WHERE Name = '{4}')), ",
+                    column.name, column.type, column.displayName, column.parentTable, tableDef.name);
+            }
 
-                sql += string.Format("INSERT INTO ColumnDefs (Name, Type, DisplayName, TableId) VALUES {0};\n", valList.Remove(valList.Length - 2));
-                sql += string.Format("CREATE TABLE {0} ({1});\n", quotedTableName, colList.Remove(colList.Length - 2));
+            sql += string.Format("INSERT INTO ColumnDefs (Name,Type,DisplayName,ParentTable,TableId) VALUES {0};\n", valList.Remove(valList.Length - 2));
+            sql += string.Format("CREATE TABLE {0} ({1});\n", quotedTableName, colList.Remove(colList.Length - 2));
 
-                if (newSchemaVersion != 0)
-                    sql += string.Format("UPDATE Store SET Version = '{0}';", newSchemaVersion);
+            if (newSchemaVersion != 0 && _schemaVersion != newSchemaVersion)
+                sql += string.Format("UPDATE Store SET Version = '{0}';", newSchemaVersion);
 
-                ExecuteNonQuery(cnn, sql);
+            ExecuteNonQuery(cnn, sql);
+
+            // update _tableDefs if schema loaded
+            if (_schemaVersion > 0)
+            {
+                _tableDefs.Add(tableDef.name, tableDef);
+                ConfigureAdapter(tableDef);
             }
 
             if (newSchemaVersion != 0)
                 _schemaVersion = newSchemaVersion;
         }
 
-
-        public void AddColumns(string tableName, ColumnDef[] newColumns, int newSchemaVersion)
+        public void AddColumns(SQLiteConnection cnn, string tableName, ColumnDef[] newColumns, int newSchemaVersion = 0)
         {
-            if (_schemaVersion >= newSchemaVersion)
+            if (_schemaVersion != 0 && _schemaVersion >= newSchemaVersion)
                 throw new ArgumentException("New schema version should be greater then current");
 
             string quotedTableName = QuoteIdentifier(tableName);
 
-            using (SQLiteConnection cnn = OpenConnection())
+            string sql = string.Empty;
+            string colList = string.Empty;
+            string valList = string.Empty;
+
+            foreach (ColumnDef column in newColumns)
             {
-                string sql = string.Empty;
-                string colList = string.Empty;
-                string valList = string.Empty;
+                if (column.type.StartsWith("TABLE")) // TABLE parentTable
+                    colList += string.Format("ALTER TABLE {0} ADD {1} INTEGER {2}, FOREIGN KEY({1}) REFERENCES {3}(Id), ",
+                        quotedTableName,
+                        QuoteIdentifier(column.name),
+                        (column.allowDBNull) ? string.Empty : "NOT NULL",
+                        QuoteIdentifier(column.parentTable)
+                    );
+                else
+                    sql += string.Format("ALTER TABLE {0} ADD {1} {2} {3} {4};\n",
+                        quotedTableName,
+                        QuoteIdentifier(column.name),
+                        column.type,
+                        (column.allowDBNull) ? string.Empty : "NOT NULL",
+                        (column.defValue != null) ? "DEFAULT " + column.defValue : string.Empty
+                    );
 
-                foreach (ColumnDef column in newColumns)
-                {
-                    if (column.type.StartsWith("TABLE")) // TABLE parentTable
-                    {
-                        colList += string.Format("ALTER TABLE {0} ADD {1} INT {2}, FOREIGN KEY({1}) REFERENCES {3}(Id), ",
-                            quotedTableName,
-                            QuoteIdentifier(column.name),
-                            (column.allowDBNull) ? "NULL" : string.Empty,
-                            QuoteIdentifier(column.parentTable)
-                            );
-                    }
-                    else
-                        sql += string.Format("ALTER TABLE {0} ADD {1} {2} {3} {4};\n",
-                            quotedTableName,
-                            QuoteIdentifier(column.name),
-                            column.type,
-                            (column.allowDBNull) ? "NULL" : string.Empty,
-                            (column.defValue != null) ? "DEFAULT " + column.defValue : string.Empty
-                            );
+                valList += string.Format("('{0}','{1}','{2}','{3}',(SELECT Id FROM TableDefs WHERE Name = '{4}')), ",
+                    column.name, column.type, column.displayName, column.parentTable, tableName);
+            }
 
-                    valList += string.Format("('{0}','{1}','{2}',(SELECT Id FROM TableDefs WHERE Name = '{3}')), ",
-                        column.name, column.type, column.displayName, tableName);
-                }
-
-                sql += string.Format("INSERT INTO ColumnDefs (Name, Type, DisplayName, TableId) VALUES {0};\n", valList.Remove(valList.Length - 2));
+            sql += string.Format("INSERT INTO ColumnDefs (Name,Type,DisplayName,ParentTable,TableId) VALUES {0};\n", valList.Remove(valList.Length - 2));
+            
+            if (newSchemaVersion != 0 && _schemaVersion != newSchemaVersion)
                 sql += string.Format("UPDATE Store SET Version = '{0}';", newSchemaVersion);
 
-                ExecuteNonQuery(cnn, sql);
+            ExecuteNonQuery(cnn, sql);
 
-                _schemaVersion = newSchemaVersion;
+            // update _tableDefs if schema already loaded
+            if (_schemaVersion > 0)
+            {
+                LoadTableDefs(cnn);
+
+                _adapters.Clear();
+                foreach (TableDef tableDef in _tableDefs.Values)
+                    ConfigureAdapter(tableDef);
             }
+
+            if (newSchemaVersion != 0)
+                _schemaVersion = newSchemaVersion;
         }
 
-        /*private void DropAllColumns(SQLiteCommand command, string quotedTableName)
+        public void DropTable(SQLiteConnection cnn, string tableName)
         {
-            string colList = string.Empty;
+            string sql = string.Format(@"
+DELETE FROM ColumnDefs WHERE TableId = (SELECT Id FROM TableDefs WHERE Name = '{0}');
+DELETE FROM TableDefs WHERE Name = '{0}';
+DROP TABLE {1};", 
+                tableName, QuoteIdentifier(tableName));
 
-            command.CommandText = string.Format("SELECT Name FROM ColumnDefs WHERE TableId = (SELECT Id FROM TableDefs WHERE Name = '{0}')", 
-                quotedTableName);
-
-            var reader = command.ExecuteReader();
-            while (reader.Read())
-                colList += QuoteIdentifier((string)reader[0]) + ", ";
-
-            string Sql = string.Format("ALTER TABLE {0} DROP COLUMN {1};\n", quotedTableName, colList.Remove(colList.Length - 2));
-            Sql += string.Format("DELETE FROM ColumnDefs WHERE TableId = (SELECT Id FROM TableDefs WHERE Name = '{0}')", quotedTableName);
-
-            reader.Close();
-
-            command.CommandText = Sql;
-            command.ExecuteNonQuery();
-        }*/
+            ExecuteNonQuery(cnn, sql);
+        }
 
         /*public void DropColumns(string[] columnNames, string tableName, int newSchemaVersion)
         {
@@ -399,15 +462,36 @@ CREATE INDEX Name_Idx ON ColumnDefs (Name)";
 
     // ----------------
 
+    //TODO: separate in two classes ('In' and 'Out' Defs)
     public class ColumnDef
     {
+        // IN & OUT
         public int id;
         public string name;
         public string displayName;
         public string type;
-        public string parentTable;
+        public string parentTable = "";
         public bool allowDBNull;
         public string defValue;
+
+        // OUT
+        public string tableName;
+        public bool IsChildTable 
+        {
+            get { return parentTable != ""; }
+        }
+
+        private string _relName = "";
+        public string RelationName
+        {
+            get 
+            { 
+                if (_relName == "" && IsChildTable)
+                    _relName = string.Format("{0}-{1}", parentTable, tableName);
+
+                return _relName;
+            }
+        }
     }
 
     public class TableDef
@@ -416,5 +500,17 @@ CREATE INDEX Name_Idx ON ColumnDefs (Name)";
         public string name;
         public string displayName;
         public ColumnDef[] columns;
+
+        public bool HasChildTables
+        {
+            get
+            {
+                foreach (ColumnDef column in columns)
+                    if (column.IsChildTable)
+                        return true;
+
+                return false;
+            }
+        }
     }
 }
